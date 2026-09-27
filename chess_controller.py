@@ -1,6 +1,7 @@
 """Draw a python-chess board in an open WPS Spreadsheet workbook."""
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,9 +50,9 @@ def draw_board(
 			square = chess.square(column, 7 - row)
 			piece = board.piece_at(square)
 			symbol = piece.symbol() if piece else "."
-			sheet.Cells(start_row + row, start_column + column).Value = (
-				PIECE_UNICODE[symbol]
-			)
+			cell = sheet.Cells(start_row + row, start_column + column)
+			cell.Value = PIECE_UNICODE[symbol]
+			cell.Font.Color = 255 if piece and piece.color == chess.WHITE else 0
 
 
 def create_stockfish_engine(
@@ -79,18 +80,118 @@ def get_stockfish_path() -> str:
 	return str(path)
 
 
+def set_cell_value(sheet: Any, cell: str, value: str) -> None:
+	"""Write a value to a WPS cell."""
+	row, column = cell_coordinates(cell)
+	sheet.Cells(row, column).Value = value
+
+
+def get_cell_value(sheet: Any, cell: str) -> str:
+	"""Read a WPS cell as trimmed text."""
+	row, column = cell_coordinates(cell)
+	value = sheet.Cells(row, column).Value
+	return str(value).strip() if value is not None else ""
+
+
+def cell_coordinates(cell: str) -> tuple[int, int]:
+	"""Convert an A1-style cell address into WPS row and column numbers."""
+	letters = "".join(character for character in cell.upper() if character.isalpha())
+	digits = "".join(character for character in cell if character.isdigit())
+	if not letters or not digits:
+		raise ValueError(f"Invalid cell address: {cell}")
+
+	column = 0
+	for character in letters:
+		column = column * 26 + ord(character) - ord("A") + 1
+	return int(digits), column
+
+
+def game_over_message(board: chess.Board) -> str | None:
+	"""Return the result message when the game has ended."""
+	if board.is_checkmate():
+		winner = "Trắng" if board.turn == chess.BLACK else "Đen"
+		return f"Chiếu bí! {winner} thắng."
+	if board.is_stalemate():
+		return "Ván cờ hòa do pat."
+	if board.is_repetition(3):
+		return "Ván cờ hòa do lặp nước."
+	if board.is_insufficient_material():
+		return "Ván cờ hòa do không đủ quân chiếu bí."
+	return None
+
+
+def play_game(
+	sheet: Any,
+	engine: chess.engine.SimpleEngine,
+	poll_interval: float = 0.5,
+) -> None:
+	"""Run a WPS polling loop with the human playing White."""
+	board = chess.Board()
+	draw_board(board, sheet)
+	set_cell_value(sheet, "L3", "Nhập nước đi của bạn và nhấn Enter.")
+	set_cell_value(sheet, "N3", "")
+	set_cell_value(sheet, "L4", "")
+	set_cell_value(sheet, "L6", "Đến lượt bạn (Trắng).")
+	set_cell_value(sheet, "L8", "")
+	set_cell_value(sheet, "L9", "Nước đi của Stockfish")
+
+	while True:
+		if get_cell_value(sheet, "N3").casefold() == "reset":
+			board = chess.Board()
+			set_cell_value(sheet, "N3", "")
+			set_cell_value(sheet, "L4", "")
+			set_cell_value(sheet, "L8", "")
+			draw_board(board, sheet)
+			set_cell_value(sheet, "L6", "Đến lượt bạn (Trắng).")
+			continue
+
+		result_message = game_over_message(board)
+		if result_message:
+			set_cell_value(sheet, "L6", result_message)
+			return
+
+		if board.turn == chess.WHITE:
+			move_text = get_cell_value(sheet, "L4")
+			if not move_text:
+				time.sleep(poll_interval)
+				continue
+			try:
+				move = chess.Move.from_uci(move_text.lower())
+			except ValueError:
+				set_cell_value(sheet, "L6", "Nước đi sai luật, vui lòng nhập lại")
+				time.sleep(poll_interval)
+				continue
+			if move not in board.legal_moves:
+				set_cell_value(sheet, "L6", "Nước đi sai luật, vui lòng nhập lại")
+				time.sleep(poll_interval)
+				continue
+
+			board.push(move)
+			set_cell_value(sheet, "L4", "")
+			draw_board(board, sheet)
+			continue
+
+		set_cell_value(sheet, "L6", "Stockfish đang tính...")
+		result = engine.play(board, chess.engine.Limit(time=1.0))
+		if result.move is None:
+			set_cell_value(sheet, "L6", "Không tìm thấy nước đi hợp lệ.")
+			return
+		board.push(result.move)
+		set_cell_value(sheet, "L8", result.move.uci())
+		draw_board(board, sheet)
+		set_cell_value(sheet, "L6", "Đến lượt bạn (Trắng).")
+
+
 def main() -> None:
-	"""Connect WPS, draw the initial position, and start Stockfish."""
+	"""Connect WPS and run the chess game loop."""
 	stockfish_path = get_stockfish_path()
 
 	wps = connect_to_wps()
 	sheet = wps.ActiveWorkbook.ActiveSheet
-	board = chess.Board()
-	draw_board(board, sheet)
 
 	engine = create_stockfish_engine(stockfish_path)
 	try:
-		print(engine.analyse(board, chess.engine.Limit(depth=12)))
+		play_game(sheet, engine)
 	finally:
 		engine.quit()
 
